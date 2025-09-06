@@ -1,0 +1,642 @@
+import React, { useRef, useEffect, useImperativeHandle, forwardRef } from 'react';
+import * as PIXI from 'pixi.js';
+import { createAdvancedMask, MaskOptions } from './Masking';
+import { createHaze } from './effects/Haze';
+import { createLightLeak } from './effects/LightLeak';
+import { createLensFlareSystem, LensFlareSystem, createChromaticAberrationFilter } from './effects/LensFlares';
+import { getActivePreset } from '../presets/EffectPresets';
+import { createCustomGrain, updateGrainEffect } from './effects/CustomGrain';
+
+interface PixiCanvasProps {
+  image: string | null;
+  audio: string | null;
+  settings: any;
+  isPlaying: boolean;
+}
+
+export interface PixiCanvasRef {
+  getCanvas: () => HTMLCanvasElement | null;
+  getApp: () => PIXI.Application | null;
+  setExportMode: (enabled: boolean) => void;
+  getExportMode: () => boolean;
+}
+
+const PixiCanvas: React.ForwardRefRenderFunction<PixiCanvasRef, PixiCanvasProps> = ({ image, audio, settings, isPlaying }, ref) => {
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const appRef = useRef<PIXI.Application | null>(null);
+  const tickerListenerRef = useRef<((time: PIXI.Ticker) => void) | null>(null);
+  const imageTextureRef = useRef<PIXI.Texture | null>(null);
+  const grainRef = useRef<PIXI.TilingSprite | null>(null);
+  const lightLeakRef = useRef<PIXI.Sprite | null>(null);
+  const hazeRef = useRef<PIXI.TilingSprite | null>(null);
+  const maskRef = useRef<PIXI.Sprite | null>(null);
+  const lensFlareSystemRef = useRef<LensFlareSystem | null>(null);
+  const chromaticAberrationRef = useRef<PIXI.Filter | null>(null);
+  const exportModeRef = useRef<boolean>(false);
+  const particlesContainerRef = useRef<PIXI.Container | null>(null);
+  const lastSettingsRef = useRef<string>('');
+  const isInitializedRef = useRef<boolean>(false);
+
+  // Layer references
+  const backgroundLayerRef = useRef<PIXI.Container | null>(null);
+  const effectsLayerRef = useRef<PIXI.Container | null>(null);
+  const textLayerRef = useRef<PIXI.Container | null>(null);
+
+  useImperativeHandle(ref, () => ({
+    getCanvas: () => {
+      return appRef.current ? appRef.current.canvas : null;
+    },
+    setExportMode: (enabled: boolean) => {
+      exportModeRef.current = enabled;
+      
+      if (appRef.current && effectsLayerRef.current && particlesContainerRef.current) {
+        if (enabled) {
+          // Optimize effects for export performance while keeping visual quality
+          console.log('Export mode: Optimizing effects for GPU acceleration');
+          
+          // Reduce particle count for export performance
+          if (particlesContainerRef.current) {
+            particlesContainerRef.current.visible = true;
+            // Reduce particle count by 50% for export performance
+            particlesContainerRef.current.children.forEach((child: any) => {
+              if (child.emit) {
+                child.maxParticles = Math.floor(child.maxParticles * 0.5);
+              }
+            });
+          }
+          
+          // Keep essential effects but optimize
+          if (hazeRef.current) {
+            hazeRef.current.visible = true;
+            hazeRef.current.alpha = 0.7; // Restore original alpha for export
+          }
+          
+          if (lensFlareSystemRef.current) {
+            lensFlareSystemRef.current.container.visible = settings.enableLensFlares;
+          }
+          
+          // Optimize PIXI ticker for export
+          if (appRef.current) {
+            appRef.current.ticker.maxFPS = 60; // Ensure smooth 60fps for capture
+            appRef.current.ticker.minFPS = 30; // Minimum acceptable FPS
+          }
+        } else {
+          // Restore full effects after export
+          console.log('Export mode: Restoring full effect quality');
+          
+          // Restore full particle count
+          if (particlesContainerRef.current) {
+            particlesContainerRef.current.visible = true;
+            particlesContainerRef.current.children.forEach((child: any) => {
+              if (child.emit && child.maxParticles) {
+                child.maxParticles = Math.floor(child.maxParticles * 2); // Restore original count
+              }
+            });
+          }
+          
+          // Restore full alpha values
+          if (hazeRef.current) {
+            hazeRef.current.visible = true;
+            hazeRef.current.alpha = 1.0; // Full alpha restored
+          }
+          
+          if (lensFlareSystemRef.current) {
+            lensFlareSystemRef.current.container.visible = true;
+          }
+          
+          // Reset ticker to normal settings
+          if (appRef.current) {
+            appRef.current.ticker.maxFPS = 0; // No FPS limit
+            appRef.current.ticker.minFPS = 10; // Lower minimum for battery saving
+          }
+          
+          // Re-apply grain effect
+          if (settings.grain && grainRef.current) {
+            grainRef.current.visible = true;
+          }
+          if (chromaticAberrationRef.current) {
+            filters.push(chromaticAberrationRef.current);
+          }
+          if (filters.length > 0) {
+            appRef.current.stage.filters = filters;
+          }
+        }
+      }
+    },
+    getApp: () => {
+      return appRef.current;
+    },
+    getExportMode: () => exportModeRef.current
+  }));
+
+  useEffect(() => {
+    const updateCanvas = async () => {
+      try {
+        // Debounce rapid updates to prevent ResizeObserver issues
+        await new Promise(resolve => setTimeout(resolve, 50));
+      
+      // Check if we need to recreate the app or can reuse existing one
+      const currentSettingsKey = JSON.stringify({
+        preset: settings.preset,
+        grain: settings.grain,
+        lightLeak: settings.lightLeak,
+        enableSimpleParticles: settings.enableSimpleParticles,
+        particleType: settings.particleType,
+        enableLensFlares: settings.enableLensFlares,
+        textMaskEnabled: settings.textMaskEnabled,
+        textMaskThreshold: settings.textMaskThreshold,
+        textMaskInvert: settings.textMaskInvert,
+        textMaskEdgeStrength: settings.textMaskEdgeStrength,
+        textMaskMorphologySize: settings.textMaskMorphologySize,
+        textMaskPreview: settings.textMaskPreview
+      });
+      
+      const needsRecreation = !appRef.current || !isInitializedRef.current || 
+        lastSettingsRef.current !== currentSettingsKey || !image;
+      
+      lastSettingsRef.current = currentSettingsKey;
+      
+      if (needsRecreation) {
+        // Destroy existing app if it exists
+        if (appRef.current) {
+          // Remove the ticker listener before destroying the app
+          if (tickerListenerRef.current) {
+            appRef.current.ticker.remove(tickerListenerRef.current);
+            tickerListenerRef.current = null;
+          }
+          appRef.current.destroy(true, true);
+          appRef.current = null;
+          isInitializedRef.current = false;
+        }
+
+      // Clean up references
+      if (hazeRef.current) {
+        hazeRef.current.destroy();
+        hazeRef.current = null;
+      }
+      if (lightLeakRef.current) {
+        lightLeakRef.current.destroy();
+        lightLeakRef.current = null;
+      }
+      if (lensFlareSystemRef.current) {
+        lensFlareSystemRef.current.destroy();
+        lensFlareSystemRef.current = null;
+      }
+      if (maskRef.current) {
+        maskRef.current.destroy();
+        maskRef.current = null;
+      }
+      backgroundLayerRef.current = null;
+      effectsLayerRef.current = null;
+      textLayerRef.current = null;
+
+      // Recreate the Pixi Application
+      console.log('Creating new PIXI application...');
+      const app = new PIXI.Application();
+      
+      // Get container dimensions to create properly sized canvas
+      const containerWidth = canvasRef.current?.clientWidth || 800;
+      const containerHeight = canvasRef.current?.clientHeight || 600;
+      
+      console.log('Container dimensions:', containerWidth, 'x', containerHeight);
+      
+      await app.init({
+        width: containerWidth,
+        height: containerHeight,
+        backgroundColor: 0x000000,
+        preserveDrawingBuffer: true,
+      });
+      appRef.current = app;
+      
+      if (canvasRef.current) {
+        console.log('Adding canvas to DOM...');
+        canvasRef.current.appendChild(app.canvas as unknown as Node);
+        
+        // Style the canvas
+        const canvas = app.canvas as HTMLCanvasElement;
+        canvas.style.display = 'block';
+        canvas.style.width = '100%';
+        canvas.style.height = '100%';
+        console.log('Canvas styled and added to DOM');
+      } else {
+        console.error('Canvas ref is null!');
+      }
+
+      // Create the three layers
+      const backgroundLayer = new PIXI.Container();
+      const effectsLayer = new PIXI.Container();
+      const textLayer = new PIXI.Container();
+
+      backgroundLayerRef.current = backgroundLayer;
+      effectsLayerRef.current = effectsLayer;
+      textLayerRef.current = textLayer;
+
+      // Add layers to stage in order
+      app.stage.addChild(backgroundLayer);
+      app.stage.addChild(effectsLayer);
+      app.stage.addChild(textLayer);
+      console.log("Added layers to stage. Stage children count:", app.stage.children.length);
+
+      // Setup optimized ticker listener
+      let lightLeakTime = 0;
+      
+      const listener = (ticker: PIXI.Ticker) => {
+        try {
+          // Always update effects consistently for both live and export
+          // Update haze effect
+          if (hazeRef.current && hazeRef.current.visible) {
+            hazeRef.current.tilePosition.x += ticker.deltaTime * 1;
+            hazeRef.current.tilePosition.y += ticker.deltaTime * 1;
+          }
+          
+          // Update basic light leak
+          if (lightLeakRef.current && lightLeakRef.current.visible) {
+            lightLeakTime += ticker.deltaTime;
+            lightLeakRef.current.alpha = (Math.sin(lightLeakTime * 0.01) + 1) / 2 * 0.2;
+          }
+          
+          // Update lens flare system
+          if (lensFlareSystemRef.current && lensFlareSystemRef.current.container.visible) {
+            lensFlareSystemRef.current.update(ticker.deltaTime);
+          }
+          
+          // Update grain effect
+          if (grainRef.current && grainRef.current.visible) {
+            updateGrainEffect(grainRef.current, ticker.deltaTime);
+          }
+        } catch (error) {
+          console.error('Error in ticker update:', error);
+        }
+      };
+      app.ticker.add(listener);
+      tickerListenerRef.current = listener;
+
+      // Initialize custom grain effect
+      try {
+        console.log('Creating custom grain effect...');
+        grainRef.current = createCustomGrain(app.screen.width, app.screen.height);
+        grainRef.current.visible = false; // Start hidden, will be shown if grain setting is enabled
+        console.log('Custom grain effect created successfully');
+      } catch (error) {
+        console.error('Error initializing custom grain effect:', error);
+        // Fallback - disable grain effect
+        grainRef.current = null;
+      }
+      
+      lightLeakRef.current = createLightLeak(app.screen.width, app.screen.height);
+
+      try {
+        // Destroy old image texture if it exists
+        if (imageTextureRef.current) {
+          imageTextureRef.current.destroy(true);
+          imageTextureRef.current = null;
+        }
+
+        if (!image) {
+          console.log("No image to load.");
+          return;
+        }
+
+        console.log("Loading image:", image);
+        const texture = await PIXI.Assets.load(image);
+        imageTextureRef.current = texture;
+
+        const imageSprite = new PIXI.Sprite(texture);
+        imageSprite.anchor.set(0.5);
+        imageSprite.x = app.screen.width / 2;
+        imageSprite.y = app.screen.height / 2;
+        
+        // Scale the image to fit the canvas properly (cover the entire canvas)
+        const scaleX = app.screen.width / texture.width;
+        const scaleY = app.screen.height / texture.height;
+        const scale = Math.max(scaleX, scaleY); // Use Math.max to cover the entire canvas
+        imageSprite.scale.set(scale);
+
+        console.log("Image sprite created successfully");
+        console.log("Image dimensions:", texture.width, "x", texture.height);
+        console.log("Canvas dimensions:", app.screen.width, "x", app.screen.height);
+        console.log("Scale applied:", scale);
+        console.log("Sprite position:", imageSprite.x, imageSprite.y);
+        
+        // Add image to background layer
+        backgroundLayer.addChild(imageSprite);
+        console.log("Image sprite added to background layer");
+        console.log("Background layer children count:", backgroundLayer.children.length);
+        console.log("Background layer visible:", backgroundLayer.visible);
+        console.log("Image sprite visible:", imageSprite.visible);
+        console.log("Image sprite alpha:", imageSprite.alpha);
+
+        // Get active preset configuration
+        const activePreset = getActivePreset(settings);
+        console.log("Active preset:", activePreset.name, activePreset.effects);
+        
+        // Clean up any existing particle effects before creating new ones
+        if (particlesContainerRef.current) {
+          try {
+            // Remove ticker functions if they exist
+            const updaters = (particlesContainerRef.current as any).particleUpdaters;
+            if (updaters && Array.isArray(updaters)) {
+              updaters.forEach((updater: (ticker: PIXI.Ticker) => void) => {
+                app.ticker.remove(updater);
+              });
+            }
+            effectsLayer.removeChild(particlesContainerRef.current);
+            particlesContainerRef.current.destroy({ children: true });
+            particlesContainerRef.current = null;
+          } catch (error) {
+            console.error('Error cleaning up particles container:', error);
+          }
+        }
+        
+        // Clean up existing haze effect
+        if (hazeRef.current) {
+          try {
+            effectsLayer.removeChild(hazeRef.current);
+            (hazeRef.current as PIXI.TilingSprite).destroy();
+            hazeRef.current = null;
+          } catch (error) {
+            console.error('Error cleaning up haze effect:', error);
+          }
+        }
+        
+        // Apply preset-based effects
+        if (activePreset.effects.enableSimpleParticles && activePreset.effects.particleType) {
+          console.log("Creating particle effects:", activePreset.effects.particleType);
+          if (activePreset.effects.particleType === 'haze') {
+            try {
+              hazeRef.current = createHaze(app.screen.width, app.screen.height);
+              effectsLayer.addChild(hazeRef.current);
+            } catch (error) {
+              console.error('Error creating haze effect:', error);
+            }
+          } else {
+            // Already cleaned up above, now create new particles
+            
+            // Create optimized particle effects for dust, snow, sparkles
+            const particlesContainer = new PIXI.Container();
+            particlesContainerRef.current = particlesContainer;
+            
+            // Store particle update functions for cleanup
+            const particleUpdaters: ((ticker: PIXI.Ticker) => void)[] = [];
+            
+            // Increase particle count by 33% (from 25 to 33)
+            const particleCount = exportModeRef.current ? 15 : 33;
+            
+            for (let i = 0; i < particleCount; i++) {
+              const particle = new PIXI.Graphics();
+              // Vary particle sizes more
+              const size = Math.random() * 2.5 + 0.3;
+              particle.circle(0, 0, size);
+              particle.fill(0xffffff);
+              
+              // More varied opacity for depth effect (some very faint, some more visible)
+              const opacityRoll = Math.random();
+              if (opacityRoll < 0.3) {
+                // 30% very faint particles
+                particle.alpha = Math.random() * 0.1 + 0.05;
+              } else if (opacityRoll < 0.7) {
+                // 40% medium opacity particles
+                particle.alpha = Math.random() * 0.2 + 0.15;
+              } else {
+                // 30% more visible particles
+                particle.alpha = Math.random() * 0.25 + 0.25;
+              }
+              
+              particle.x = Math.random() * app.screen.width;
+              particle.y = Math.random() * app.screen.height;
+              
+              // Consistent particle animation for both live and export
+              // Vary speeds based on size - smaller particles fall slower (more realistic)
+              const baseSpeed = 0.8 + (size / 2.5) * 1.2; // Speed varies from 0.8 to 2.0
+              const particleUpdate = (ticker: PIXI.Ticker) => {
+                // Check if particle still exists before updating
+                if (!particle.destroyed) {
+                  // Use a fixed speed that works for both live and export
+                  // deltaTime is roughly 16.67 at 60fps, so we normalize to that
+                  const normalizedDelta = ticker.deltaTime / 16.67;
+                  particle.y += baseSpeed * normalizedDelta;
+                  
+                  // Add slight horizontal drift for more natural movement
+                  particle.x += Math.sin(particle.y * 0.01) * 0.3 * normalizedDelta;
+                  
+                  if (particle.y > app.screen.height) {
+                    particle.y = -10;
+                    particle.x = Math.random() * app.screen.width;
+                  }
+                  
+                  // Wrap horizontal position
+                  if (particle.x > app.screen.width) {
+                    particle.x = 0;
+                  } else if (particle.x < 0) {
+                    particle.x = app.screen.width;
+                  }
+                }
+              };
+              app.ticker.add(particleUpdate);
+              particleUpdaters.push(particleUpdate);
+              
+              particlesContainer.addChild(particle);
+            }
+            
+            // Store updaters for cleanup
+            (particlesContainer as any).particleUpdaters = particleUpdaters;
+            
+            effectsLayer.addChild(particlesContainer);
+          }
+        }
+        
+        // Clean up existing lens flare system before creating a new one
+        if (lensFlareSystemRef.current) {
+          try {
+            effectsLayer.removeChild((lensFlareSystemRef.current as any).container);
+            (lensFlareSystemRef.current as any).destroy();
+            lensFlareSystemRef.current = null;
+          } catch (error) {
+            console.error('Error cleaning up lens flare system:', error);
+          }
+        }
+        
+        // Clear chromatic aberration filter reference
+        if (chromaticAberrationRef.current) {
+          chromaticAberrationRef.current = null;
+        }
+        
+        // Apply lens flare system if enabled
+        if (activePreset.effects.enableLensFlares && activePreset.effects.lensFlareConfig) {
+          try {
+            console.log("Creating lens flare system with config:", activePreset.effects.lensFlareConfig);
+            lensFlareSystemRef.current = createLensFlareSystem(
+              app.screen.width,
+              app.screen.height,
+              activePreset.effects.lensFlareConfig
+            );
+            effectsLayer.addChild(lensFlareSystemRef.current.container);
+            
+            // Apply chromatic aberration if enabled
+            if (activePreset.effects.lensFlareConfig.chromaticAberration) {
+              chromaticAberrationRef.current = createChromaticAberrationFilter(
+                activePreset.effects.lensFlareConfig.aberrationStrength
+              );
+            }
+          } catch (error) {
+            console.error('Error creating lens flare system:', error);
+          }
+        }
+
+        // Apply text masking if enabled
+        if (settings.textMaskEnabled) {
+          try {
+            console.log("Creating text mask...");
+            const maskOptions: MaskOptions = {
+              threshold: settings.textMaskThreshold || 128,
+              invert: settings.textMaskInvert || false,
+              edgeDetectionStrength: settings.textMaskEdgeStrength || 1.5,
+              morphologySize: settings.textMaskMorphologySize || 2,
+              previewMode: settings.textMaskPreview || false
+            };
+            
+            const maskSprite = await createAdvancedMask(image, maskOptions);
+            maskRef.current = maskSprite;
+            
+            if (settings.textMaskPreview) {
+              // In preview mode, show the mask as an overlay
+              maskSprite.alpha = 0.7;
+              maskSprite.anchor.set(0.5);
+              maskSprite.x = app.screen.width / 2;
+              maskSprite.y = app.screen.height / 2;
+              textLayer.addChild(maskSprite);
+            } else {
+              // Apply mask to effects layer to hide effects where text is present
+              effectsLayer.mask = maskSprite;
+              maskSprite.anchor.set(0.5);
+              maskSprite.x = app.screen.width / 2;
+              maskSprite.y = app.screen.height / 2;
+              // Don't add mask to display list when using as mask
+            }
+            console.log("Text mask created successfully");
+          } catch (error) {
+            console.error('Error creating text mask:', error);
+          }
+        }
+
+        // Apply filters based on preset (only chromatic aberration now)
+        const filters: PIXI.Filter[] = [];
+        
+        console.log('Applying filters. Settings.grain:', settings.grain, 'grainRef.current:', !!grainRef.current);
+        
+        if (chromaticAberrationRef.current) {
+          console.log('Adding ChromaticAberrationFilter to filters');
+          filters.push(chromaticAberrationRef.current);
+        }
+        
+        console.log('Total filters to apply:', filters.length);
+        
+        if (filters.length > 0) {
+          app.stage.filters = filters;
+          console.log('Filters applied to stage');
+        } else {
+          app.stage.filters = null;
+          console.log('No filters applied, cleared stage filters');
+        }
+
+        // Add basic light leak if enabled in preset
+        if (activePreset.effects.lightLeak && lightLeakRef.current) {
+          lightLeakRef.current.visible = true;
+          effectsLayer.addChild(lightLeakRef.current);
+        }
+        
+        // Add custom grain effect if created successfully
+        if (grainRef.current) {
+          grainRef.current.visible = settings.grain;
+          effectsLayer.addChild(grainRef.current);
+          console.log('Custom grain effect added to effects layer, visible:', settings.grain);
+        }
+
+        console.log("Canvas setup completed successfully");
+        isInitializedRef.current = true;
+
+      } catch (error) {
+        console.error("Error loading image:", error);
+        if (appRef.current) {
+          appRef.current.stage.removeChildren();
+        }
+        isInitializedRef.current = false;
+      }
+    } else if (appRef.current && image) {
+      // Fast path: just update the image texture if only image changed
+      try {
+        // Destroy old image texture if it exists
+        if (imageTextureRef.current) {
+          imageTextureRef.current.destroy(true);
+          imageTextureRef.current = null;
+        }
+        
+        console.log("Fast update - loading new image:", image);
+        const texture = await PIXI.Assets.load(image);
+        imageTextureRef.current = texture;
+        
+        // Update existing image sprite if it exists
+        if (backgroundLayerRef.current && backgroundLayerRef.current.children.length > 0) {
+          const imageSprite = backgroundLayerRef.current.children[0] as PIXI.Sprite;
+          if (imageSprite instanceof PIXI.Sprite) {
+            imageSprite.texture = texture;
+            console.log("Image sprite texture updated successfully");
+          }
+        }
+      } catch (error) {
+        console.error("Error updating image:", error);
+        // Fall back to full recreation on error
+        lastSettingsRef.current = '';
+        updateCanvas();
+        return;
+      }
+    } catch (error) {
+      console.error('Error in updateCanvas:', error);
+        // Try to clean up any partial state
+        if (appRef.current) {
+          appRef.current.destroy(true, true);
+          appRef.current = null;
+        }
+        isInitializedRef.current = false;
+      }
+    };
+
+    updateCanvas();
+
+    // Cleanup for when the component unmounts
+    return () => {
+      if (appRef.current) {
+        appRef.current.ticker.stop();
+        if (tickerListenerRef.current) {
+          appRef.current.ticker.remove(tickerListenerRef.current);
+          tickerListenerRef.current = null;
+        }
+        appRef.current.destroy(true, true);
+        appRef.current = null;
+      }
+    };
+  }, [image, settings.preset, settings.grain, settings.lightLeak, settings.enableSimpleParticles, settings.particleType, settings.enableLensFlares, settings.textMaskEnabled, settings.textMaskThreshold, settings.textMaskInvert, settings.textMaskEdgeStrength, settings.textMaskMorphologySize, settings.textMaskPreview]);
+
+  // Handle play/pause
+  useEffect(() => {
+    if (appRef.current) {
+      if (isPlaying) {
+        appRef.current.ticker.start();
+      } else {
+        appRef.current.ticker.stop();
+      }
+    }
+  }, [isPlaying]);
+
+  // Handle grain effect changes
+  useEffect(() => {
+    if (grainRef.current && appRef.current) {
+      grainRef.current.visible = settings.grain;
+      console.log('Grain effect visibility set to:', settings.grain);
+    }
+  }, [settings.grain]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return <div ref={canvasRef} />;
+};
+
+export default forwardRef(PixiCanvas);
