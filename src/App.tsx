@@ -170,7 +170,9 @@ function AppContent() {
       throw new Error(`Empty pixel data: width=${width}, height=${height}`);
     }
     if (pixels.length !== expectedSize) {
-      console.warn(`Pixel size mismatch: expected ${expectedSize}, got ${pixels.length}`);
+      console.warn(`Pixel size mismatch: expected ${expectedSize} (${width}x${height}x4), got ${pixels.length}`);
+      // Don't throw error, but log the issue for debugging
+      console.warn(`This may indicate a resolution mismatch between canvas and expected output dimensions`);
     }
     
     // OPTIMIZATION: Skip vertical flip - handle with CSS transform or FFmpeg instead
@@ -369,11 +371,16 @@ function AppContent() {
       const frameRate = config.frameRate;
       const frameCount = settings.duration * frameRate;
 
-      // Calculate export dimensions based on resolution setting
-      const originalWidth = pixiApp?.screen.width || canvas.width;
-      const originalHeight = pixiApp?.screen.height || canvas.height;
-      const exportWidth = Math.floor(originalWidth * config.exportResolution);
-      const exportHeight = Math.floor(originalHeight * config.exportResolution);
+      // Calculate export dimensions based on actual canvas resolution, not screen dimensions
+      // pixiApp.screen might be different from actual canvas size
+      const actualCanvasWidth = canvas.width;
+      const actualCanvasHeight = canvas.height;
+      const exportWidth = Math.floor(actualCanvasWidth * config.exportResolution);
+      const exportHeight = Math.floor(actualCanvasHeight * config.exportResolution);
+      
+      console.log(`📐 Canvas actual size: ${actualCanvasWidth}x${actualCanvasHeight}`);
+      console.log(`📐 PIXI screen size: ${pixiApp?.screen.width}x${pixiApp?.screen.height}`);
+      console.log(`📐 Export dimensions: ${exportWidth}x${exportHeight} (resolution: ${config.exportResolution})`);
 
       // GPU-accelerated frame capture with optimized intervals
       console.log(`🎬 Starting capture: ${frameCount} frames (${exportWidth}x${exportHeight} at ${frameRate}fps)`);
@@ -458,14 +465,14 @@ function AppContent() {
                 const gl = renderer.gl;
                 if (gl && useWebGLCapture) {
                   try {
-                    // Read at full resolution first
-                    const fullPixelCount = pixiApp.screen.width * pixiApp.screen.height * 4;
+                    // Read at actual canvas resolution
+                    const fullPixelCount = actualCanvasWidth * actualCanvasHeight * 4;
                     const fullPixelBuffer = getPixelBuffer(fullPixelCount);
                     
-                    // Direct GPU memory read - much faster than PIXI's extraction
+                    // Direct GPU memory read - use actual canvas dimensions
                     gl.readPixels(
                       0, 0,
-                      pixiApp.screen.width, pixiApp.screen.height,
+                      actualCanvasWidth, actualCanvasHeight,
                       gl.RGBA, gl.UNSIGNED_BYTE,
                       fullPixelBuffer
                     );
@@ -474,8 +481,8 @@ function AppContent() {
                     if (config.exportResolution < 1.0) {
                       pixels = await downsamplePixels(
                         fullPixelBuffer, 
-                        pixiApp.screen.width, 
-                        pixiApp.screen.height,
+                        actualCanvasWidth, 
+                        actualCanvasHeight,
                         exportWidth,
                         exportHeight
                       );
